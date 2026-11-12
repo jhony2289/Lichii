@@ -25,6 +25,7 @@
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_list_macro_trace.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -348,6 +349,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                if (VideoCommon::ListMacroTrace::g_enabled) {
+                    VideoCommon::ListMacroTrace::NoteQmd(address, descriptor);
+                }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -370,11 +374,16 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
-                        const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
-                                                          memory_manager.Read<u32>(address), payload);
+                        const auto combine = [&](u32 current) {
+                            return ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1, current, payload);
+                        };
+                        const u32 guest = memory_manager.Read<u32>(address);
+                        const u32 value = combine(guest);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+                                *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
+                                             *device, address, guest, value, combine));
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -395,10 +404,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
                     rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
+                        const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
+                        const u32 guest = memory_manager.Read<u32>(address);
+                        const u32 value = combine(guest);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+                                *device, Tegra::Nx2MirrorShadow::Get().NoteCombinedRelease(
+                                             *device, address, guest, value, combine));
                         }
                     });
                 } else {
@@ -777,6 +790,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     }
     if (native_key == passes->prepass) {
         dlss_chain.spatial_only = passes->spatial_only;
+        dlss_chain.render_region = passes->render_region;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
@@ -1221,17 +1235,23 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return GetTICEntry(tic_index);
     };
     const auto color = image(0x278), motion = image(0x290);
+    // A game that renders a region of its targets (The Duskbloods) draws it on the same pixel grid
+    // in targets of other sizes: in handheld mode its motion and depth are 1536x864 against a
+    // 1920x1080 colour. The upscale checks the region fits them.
+    const auto same_grid = [&](const Texture::TICEntry& other) {
+        return dlss_chain.render_region ||
+               (other.Width() == color->Width() && other.Height() == color->Height());
+    };
     if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
-        motion->Width() != color->Width() || motion->Height() != color->Height() ||
-        !motion->IsBlockLinear())
+        !same_grid(*motion) || !motion->IsBlockLinear())
         return;
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
-    const auto depth = cbuf.size.Value() >= 0x29c ? image(0x298) : std::nullopt;
+    const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
+    const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
     if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        depth->Width() == color->Width() && depth->Height() == color->Height() &&
-        depth->IsBlockLinear()) {
+        same_grid(*depth) && depth->IsBlockLinear()) {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
@@ -1317,6 +1337,70 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     }
 }
 
+// Scales the region the game rendered up to the output, in place of the network's output pass.
+bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
+                                          const std::optional<Texture::TICEntry>& input,
+                                          const std::optional<Texture::TICEntry>& output,
+                                          const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+                                          const std::optional<Texture::TICEntry>& motion,
+                                          const std::optional<Texture::TICEntry>& depth) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    if (!input || !output || !PlainImage(*input) || !PlainImage(*output) ||
+        input->format != Texture::TextureFormat::B10G11R11 ||
+        output->format != Texture::TextureFormat::B10G11R11 ||
+        input->Address() == output->Address() ||
+        launch_description.const_buffer_config[0].size.Value() < RenderLastColumnOffset + 4 ||
+        !memory_manager.IsFullyMappedRange(constants, RenderLastColumnOffset + 4)) {
+        return false;
+    }
+    const u32 width = memory_manager.Read<u32>(constants + RenderLastColumnOffset) + 1;
+    const u32 height = memory_manager.Read<u32>(constants + RenderLastRowOffset) + 1;
+    if (width == 0 || height == 0 || width > input->Width() || height > input->Height()) {
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
+    // region is still scaled, without history, rather than leaving the network's output.
+    const bool use_history = jitter && motion && width <= motion->Width() &&
+                             height <= motion->Height() &&
+                             (!depth || (width <= depth->Width() && height <= depth->Height()));
+    Fermi2D::Surface motion_surface{};
+    if (use_history) {
+        motion_surface = surface(*motion);
+        motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+    }
+    // The game's motion vectors point from the previous position to the current one (a rightward
+    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    const std::array<f32, 2> motion_scale =
+        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
+    const bool done = rasterizer->AccelerateTemporalUpscale(
+        surface(*input), surface(*output), motion_surface,
+        use_history && depth ? &*depth : nullptr,
+        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
+        std::array{width, height});
+    static u32 last_width{};
+    if (width != last_width) {
+        last_width = width;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+                 done ? "scaled" : "could not scale", width, height, input->Width(),
+                 input->Height(), output->Width(), output->Height());
+    }
+    return done;
+}
+
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
     static const bool requested_history = [] {
@@ -1329,7 +1413,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter || (use_history && (!motion || !depth))) {
+    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
@@ -1354,6 +1438,9 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
+    if (dlss_chain.render_region) {
+        return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
+    }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
@@ -1526,6 +1613,37 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    if (method == 0x6c3) {
+        FrontNoteReport(split, fs, argument);
+    }
+}
+
+bool KeplerCompute::FrontRunsMacroWord(u32 method) const {
+    const auto& executing = front ? front->executing_macro : native_executing_macro;
+    return method >= 0xe00 && method < native_registers.size() &&
+           (executing || (method & 1) == 0);
+}
+
+void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                    u32 control) {
+    // SET_REPORT_SEMAPHORE_D was sent: what ProcessNativeReportSemaphore will write on the back.
+    const u32 operation = control & 3;
+    if (operation != 0 && operation != 2) {
+        return;
+    }
+    const GPUVAddr address =
+        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    // A reduction combines the payload with the word's value then.
+    const bool reduction = ((control >> 3) & 1) != 0;
+    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], !reduction);
+    if (!reduction && ((control >> 28) & 1) == 0) {
+        // 64 bits (a timestamp follows).
+        split.NoteSemaphoreWrite(*device + 4, 0, true);
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1544,27 +1662,47 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method == 0x6c3) {
+        for (u32 i = 0; i < amount; ++i) {
+            FrontNoteReport(split, fs, base_start[i]);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
-    const u32 start = positions[((*fs.executing_macro - 0xe00) / 2) % positions.size()];
+    const u32 method = *fs.executing_macro;
+    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
-    const auto read = [&fs](u32 address) {
-        return address < fs.registers.size() ? fs.registers[address] : 0U;
+    namespace ListTrace = VideoCommon::ListMacroTrace;
+    ListTrace::Call* const trace =
+        ListTrace::g_enabled
+            ? ListTrace::BeginCall(ListTrace::Engine::Compute, static_cast<EngineInterface*>(this),
+                                   method, macro.native_code, macro.native_code_generation, start,
+                                   fs.parameters, *macro.native_interpreter.active_dram,
+                                   fs.registers)
+            : nullptr;
+    const auto read = [&fs, trace](u32 address) {
+        const u32 value = address < fs.registers.size() ? fs.registers[address] : 0U;
+        ListTrace::NoteRead(trace, address, value);
+        return value;
     };
     const auto emit = [&](u32 address, u32 value) {
         if (address >= 0xe00) {
             return false;
         }
+        ListTrace::NoteWrite(trace, address, value);
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        if (address == 0x6c3) {
+            FrontNoteReport(split, fs, value);
+        }
         return true;
     };
 #ifdef ARCHITECTURE_x86_64
@@ -1572,8 +1710,12 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
     macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
-    const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+    const auto result =
+        trace != nullptr && trace->data_ram
+            ? macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit)
+            : macro.native_jit->Execute(start, fs.parameters,
+                                        std::span<u32>{*macro.native_interpreter.active_dram},
+                                        read, emit);
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
@@ -1582,6 +1724,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
+    }
+    if (trace != nullptr) {
+        ListTrace::EndCall(*trace, false, macro.native_interpreter.data_ram_reads,
+                           macro.native_interpreter.data_ram_writes);
     }
     fs.parameters.clear();
 }
